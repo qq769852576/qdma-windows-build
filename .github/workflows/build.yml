@@ -1,0 +1,50 @@
+name: Build Xilinx QDMA Windows Driver
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Clone Xilinx dma_ip_drivers
+        shell: pwsh
+        run: |
+          git clone https://github.com/Xilinx/dma_ip_drivers.git dma_ip_drivers
+          cd dma_ip_drivers
+          git fetch origin pull/374/head:pr374
+          git checkout pr374
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Restore NuGet packages
+        shell: pwsh
+        working-directory: dma_ip_drivers/QDMA/windows
+        run: |
+          nuget restore QDMA.sln -PackagesDirectory packages
+
+      - name: Build QDMA x64 Release
+        shell: pwsh
+        working-directory: dma_ip_drivers/QDMA/windows
+        run: |
+          msbuild QDMA.sln /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
+
+      - name: Collect outputs
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifact | Out-Null
+          Copy-Item "dma_ip_drivers/QDMA/windows/build/x64/Release/*" "artifact/" -Recurse -Force
+          Get-ChildItem -Recurse artifact
+
+      - name: Upload QDMA Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: qdma-windows-x64-release
+          path: artifact/**
+          if-no-files-found: error
+          retention-days: 14
