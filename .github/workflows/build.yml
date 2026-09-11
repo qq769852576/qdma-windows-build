@@ -1,20 +1,174 @@
-name: Build Xilinx QDMA Windows Driver
+name: Build CPM5 Phase 1 on exact Xilinx baseline
 
 on:
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPOSITORY: https://github.com/Xilinx/dma_ip_drivers.git
+  BASELINE_SHA: 53b635697db0c9f4c117d129656187a424d85e59
+  PATCH_SHA256: 5BC78F2C270D0E09BC3635F61E693629B4ECA346F419188570A4D0B8131050C5
+  SOURCE_DIR: dma_ip_drivers
 
 jobs:
   build:
     runs-on: windows-2022
 
     steps:
-      - name: Clone Xilinx dma_ip_drivers
+      - name: Checkout cloud-build kit
+        uses: actions/checkout@v4
+
+      - name: Fetch and checkout exact Xilinx baseline
+        id: baseline
         shell: pwsh
         run: |
-          git clone https://github.com/Xilinx/dma_ip_drivers.git dma_ip_drivers
-          cd dma_ip_drivers
-          git fetch origin pull/374/head:pr374
-          git checkout pr374
+          $ErrorActionPreference = "Stop"
+          $logDir = Join-Path $env:GITHUB_WORKSPACE "logs"
+          New-Item -ItemType Directory -Force $logDir | Out-Null
+          $log = Join-Path $logDir "baseline-fetch.log"
+
+          function Run-Git([string[]]$GitArgs) {
+            $output = & git @GitArgs 2>&1
+            $exitCode = $LASTEXITCODE
+            $output | Tee-Object -FilePath $log -Append
+            if ($exitCode -ne 0) {
+              throw "git $($GitArgs -join ' ') failed with exit code $exitCode"
+            }
+          }
+
+          Run-Git @("init", $env:SOURCE_DIR)
+          Run-Git @("-C", $env:SOURCE_DIR, "remote", "add", "origin",
+            $env:UPSTREAM_REPOSITORY)
+
+          # Fetch only the required object. There is deliberately no branch,
+          # master, latest, or alternate-commit fallback.
+          Run-Git @("-C", $env:SOURCE_DIR, "fetch", "--no-tags", "--depth=1",
+            "origin", $env:BASELINE_SHA)
+          Run-Git @("-C", $env:SOURCE_DIR, "checkout", "--detach",
+            $env:BASELINE_SHA)
+
+          $actualSha = (& git -C $env:SOURCE_DIR rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to resolve checked-out HEAD"
+          }
+          Write-Host "Exact checked-out SHA: $actualSha"
+          "Exact checked-out SHA: $actualSha" | Add-Content $log
+
+          if ($actualSha.ToLowerInvariant() -ne
+              $env:BASELINE_SHA.ToLowerInvariant()) {
+            throw "SHA mismatch: expected $env:BASELINE_SHA, got $actualSha"
+          }
+
+          Write-Host "Baseline git status:"
+          & git -C $env:SOURCE_DIR status --short --branch |
+            Tee-Object -FilePath $log -Append
+
+      - name: Verify baseline, verify patch, and apply Phase 1
+        id: patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $log = Join-Path $env:GITHUB_WORKSPACE "logs\patch-verification.log"
+          Start-Transcript -Path $log -Force | Out-Null
+          try {
+            $source = Join-Path $env:GITHUB_WORKSPACE $env:SOURCE_DIR
+            $patch = Join-Path $env:GITHUB_WORKSPACE "CPM5_PHASE1.patch"
+
+            if (!(Test-Path -LiteralPath $patch -PathType Leaf)) {
+              throw "CPM5_PHASE1.patch is missing from the build kit"
+            }
+
+            $actualPatchHash =
+              (Get-FileHash -LiteralPath $patch -Algorithm SHA256).Hash
+            Write-Host "SHA256(CPM5_PHASE1.patch): $actualPatchHash"
+            if ($actualPatchHash -ne $env:PATCH_SHA256) {
+              throw "Patch SHA-256 mismatch: expected $env:PATCH_SHA256"
+            }
+
+            $requiredFiles = @(
+              "QDMA/windows/sys/libqdma/packages.config",
+              "QDMA/windows/sys/drv/packages.config",
+              "QDMA/windows/sys/libqdma/libqdma.vcxproj",
+              "QDMA/windows/sys/drv/qdma_generic.vcxproj"
+            )
+            foreach ($relativePath in $requiredFiles) {
+              $fullPath = Join-Path $source $relativePath
+              if (!(Test-Path -LiteralPath $fullPath -PathType Leaf)) {
+                throw "Required PR #374 baseline file missing: $relativePath"
+              }
+              Write-Host "Baseline file PASS: $relativePath"
+            }
+
+            $projectMarkers = @{
+              "QDMA/windows/sys/libqdma/libqdma.vcxproj" = @(
+                "Microsoft.Windows.WDK.x64.10.0.26100.6584",
+                "Microsoft.Windows.SDK.CPP.x64.10.0.26100.1"
+              )
+              "QDMA/windows/sys/drv/qdma_generic.vcxproj" = @(
+                "Microsoft.Windows.WDK.x64.10.0.26100.6584",
+                "Microsoft.Windows.SDK.CPP.x64.10.0.26100.1"
+              )
+            }
+            foreach ($relativePath in $projectMarkers.Keys) {
+              $content = Get-Content -LiteralPath `
+                (Join-Path $source $relativePath) -Raw
+              foreach ($marker in $projectMarkers[$relativePath]) {
+                if (!$content.Contains($marker)) {
+                  throw "Missing '$marker' in $relativePath"
+                }
+                Write-Host "Baseline import PASS: $relativePath -> $marker"
+              }
+            }
+
+            $checkedOutSha = (& git -C $source rev-parse HEAD).Trim()
+            if ($checkedOutSha.ToLowerInvariant() -ne
+                $env:BASELINE_SHA.ToLowerInvariant()) {
+              throw "Baseline changed before patch: $checkedOutSha"
+            }
+
+            Write-Host "Running git apply --check"
+            & git -C $source apply --check $patch
+            if ($LASTEXITCODE -ne 0) {
+              throw "git apply --check failed"
+            }
+
+            Write-Host "Applying Phase 1 patch"
+            & git -C $source apply $patch
+            if ($LASTEXITCODE -ne 0) {
+              throw "git apply failed"
+            }
+
+            Write-Host "Running git diff --check"
+            & git -C $source diff --check
+            if ($LASTEXITCODE -ne 0) {
+              throw "git diff --check failed"
+            }
+
+            $expectedFiles = @(
+              "QDMA/windows/sys/libqdma/source/qdma_access/qdma_access_common.c",
+              "QDMA/windows/sys/libqdma/source/qdma_access/qdma_access_export.h"
+            )
+            $changedFiles = @(& git -C $source diff --name-only)
+            $unexpected = @($changedFiles | Where-Object {
+              $_ -notin $expectedFiles
+            })
+            $missing = @($expectedFiles | Where-Object {
+              $_ -notin $changedFiles
+            })
+            if ($unexpected.Count -ne 0 -or $missing.Count -ne 0) {
+              throw "Patched file set mismatch. Unexpected: $unexpected; Missing: $missing"
+            }
+
+            Write-Host "Patched git status:"
+            & git -C $source status --short --branch
+            Write-Host "Patched git diff --stat:"
+            & git -C $source diff --stat
+          }
+          finally {
+            Stop-Transcript | Out-Null
+          }
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
@@ -22,177 +176,380 @@ jobs:
       - name: Setup NuGet
         uses: NuGet/setup-nuget@v2
 
-      - name: Restore NuGet packages
+      - name: Restore PR #374 NuGet packages
+        id: nuget
         shell: pwsh
         working-directory: dma_ip_drivers/QDMA/windows
         run: |
-          nuget restore QDMA.sln -PackagesDirectory packages
-
-      - name: Configure WDK tools
-        shell: pwsh
-        run: |
           $ErrorActionPreference = "Stop"
-
-          $roots = @(
-            "${env:ProgramFiles(x86)}\Windows Kits\10\bin",
-            "$env:GITHUB_WORKSPACE\dma_ip_drivers\QDMA\windows\packages"
+          $log = Join-Path $env:GITHUB_WORKSPACE "logs\nuget-restore.log"
+          $nugetArgs = @(
+            "restore", "QDMA.sln", "-PackagesDirectory", "packages",
+            "-NonInteractive"
           )
 
-          function Find-Tool([string]$name) {
-            $hits = @()
-            foreach ($root in $roots) {
-              if (Test-Path $root) {
-                $hits += Get-ChildItem -Path $root -Filter $name -Recurse -File -ErrorAction SilentlyContinue
-              }
+          & nuget @nugetArgs 2>&1 | Tee-Object -FilePath $log
+          $restoreExit = $LASTEXITCODE
+          if ($restoreExit -ne 0) {
+            throw "NuGet restore failed with exit code $restoreExit"
+          }
+
+          Write-Host "NuGet package versions from packages.config:"
+          foreach ($config in @(
+            "sys/libqdma/packages.config",
+            "sys/drv/packages.config"
+          )) {
+            [xml]$xml = Get-Content -LiteralPath $config -Raw
+            foreach ($package in $xml.packages.package) {
+              Write-Host "  $config : $($package.id) $($package.version)"
             }
-            return $hits
           }
 
-          $stampHits = @(Find-Tool "stampinf.exe")
-          if ($stampHits.Count -eq 0) {
-            throw "stampinf.exe not found"
-          }
+          Write-Host "Restored Windows SDK/WDK package directories:"
+          Get-ChildItem -LiteralPath packages -Directory |
+            Where-Object { $_.Name -like "Microsoft.Windows.*" } |
+            Sort-Object Name |
+            ForEach-Object { Write-Host "  $($_.Name)" }
 
-          Write-Host "stampinf.exe candidates:"
-          $stampHits | ForEach-Object { Write-Host "  $($_.FullName)" }
-
-          # Prefer the normal Windows Kits x64 installation over the NuGet copy.
-          $stamp = $stampHits |
-            Where-Object {
-              $_.FullName -like "*Windows Kits\10\bin*" -and
-              $_.DirectoryName -match '\\x64$'
-            } |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
-
-          if (-not $stamp) {
-            $stamp = $stampHits |
-              Where-Object { $_.DirectoryName -match '\\x64$' } |
-              Sort-Object FullName -Descending |
-              Select-Object -First 1
-          }
-
-          if (-not $stamp) {
-            $stamp = $stampHits | Select-Object -First 1
-          }
-
-          Write-Host "Selected stampinf.exe:"
-          Write-Host "  $($stamp.FullName)"
-
-          $toolDirs = New-Object System.Collections.Generic.List[string]
-          $toolDirs.Add($stamp.DirectoryName)
-
-          foreach ($toolName in @("inf2cat.exe", "signtool.exe")) {
-            $hits = @(Find-Tool $toolName)
-
-            if ($hits.Count -eq 0) {
-              Write-Host "WARNING: $toolName not found"
-              continue
-            }
-
-            $selected = $hits |
-              Where-Object {
-                $_.FullName -like "*Windows Kits\10\bin*" -and
-                $_.DirectoryName -match '\\x64$'
-              } |
-              Sort-Object FullName -Descending |
-              Select-Object -First 1
-
-            if (-not $selected) {
-              $selected = $hits |
-                Where-Object { $_.DirectoryName -match '\\x64$' } |
-                Sort-Object FullName -Descending |
-                Select-Object -First 1
-            }
-
-            if (-not $selected) {
-              $selected = $hits | Select-Object -First 1
-            }
-
-            Write-Host "$toolName = $($selected.FullName)"
-            $toolDirs.Add($selected.DirectoryName)
-          }
-
-          $toolDirs = $toolDirs | Select-Object -Unique
-
-          Write-Host ""
-          Write-Host "Adding WDK/SDK tool directories to PATH:"
-          foreach ($dir in $toolDirs) {
-            Write-Host "  $dir"
-            $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          }
-
-          # Do NOT run "stampinf.exe /?" here:
-          # StampInf prints help but may return exit code 1, causing the Action
-          # step to fail even though the executable exists.
-          Write-Host ""
-          Write-Host "WDK tool discovery PASS"
-
-      - name: Verify build environment
+      - name: Configure WDK tools
+        id: tools
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $log = Join-Path $env:GITHUB_WORKSPACE "logs\tool-discovery.log"
+          Start-Transcript -Path $log -Force | Out-Null
+          try {
+            # This is the tool discovery from the previously successful v3
+            # workflow, retaining its preference for Windows Kits x64 tools.
+            $roots = @(
+              "${env:ProgramFiles(x86)}\Windows Kits\10\bin",
+              "$env:GITHUB_WORKSPACE\dma_ip_drivers\QDMA\windows\packages"
+            )
 
-          Write-Host "MSBuild:"
-          (Get-Command msbuild).Source
+            function Find-Tool([string]$name) {
+              $hits = @()
+              foreach ($root in $roots) {
+                if (Test-Path -LiteralPath $root) {
+                  $hits += Get-ChildItem -LiteralPath $root -Filter $name `
+                    -Recurse -File -ErrorAction SilentlyContinue
+                }
+              }
+              return $hits
+            }
 
-          Write-Host "stampinf.exe:"
-          (Get-Command stampinf.exe).Source
+            function Select-X64Tool($hits) {
+              $selected = $hits |
+                Where-Object {
+                  $_.FullName -like "*Windows Kits\10\bin*" -and
+                  $_.DirectoryName -match '\\x64$'
+                } |
+                Sort-Object FullName -Descending |
+                Select-Object -First 1
+              if (!$selected) {
+                $selected = $hits |
+                  Where-Object { $_.DirectoryName -match '\\x64$' } |
+                  Sort-Object FullName -Descending |
+                  Select-Object -First 1
+              }
+              if (!$selected) {
+                $selected = $hits | Select-Object -First 1
+              }
+              return $selected
+            }
 
-          $inf2cat = Get-Command inf2cat.exe -ErrorAction SilentlyContinue
-          if ($inf2cat) {
-            Write-Host "inf2cat.exe:"
-            $inf2cat.Source
-          } else {
-            Write-Host "WARNING: inf2cat.exe is not on PATH"
+            $stampHits = @(Find-Tool "stampinf.exe")
+            if ($stampHits.Count -eq 0) {
+              throw "stampinf.exe not found"
+            }
+            $stamp = Select-X64Tool $stampHits
+            Write-Host "Selected stampinf path: $($stamp.FullName)"
+
+            $toolDirs = New-Object System.Collections.Generic.List[string]
+            $toolDirs.Add($stamp.DirectoryName)
+            "STAMPINF_PATH=$($stamp.FullName)" |
+              Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+            foreach ($toolSpec in @(
+              @{ Name = "inf2cat.exe"; Env = "INF2CAT_PATH" },
+              @{ Name = "signtool.exe"; Env = "SIGNTOOL_PATH" }
+            )) {
+              $hits = @(Find-Tool $toolSpec.Name)
+              if ($hits.Count -eq 0) {
+                Write-Host "Selected $($toolSpec.Name) path: <not found>"
+                "$($toolSpec.Env)=" |
+                  Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+                continue
+              }
+              $selected = Select-X64Tool $hits
+              Write-Host "Selected $($toolSpec.Name) path: $($selected.FullName)"
+              "$($toolSpec.Env)=$($selected.FullName)" |
+                Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+              $toolDirs.Add($selected.DirectoryName)
+            }
+
+            $msbuild = (Get-Command msbuild -ErrorAction Stop).Source
+            Write-Host "MSBuild path: $msbuild"
+            "MSBUILD_PATH=$msbuild" |
+              Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+
+            foreach ($dir in ($toolDirs | Select-Object -Unique)) {
+              Write-Host "Adding WDK/SDK tool directory to PATH: $dir"
+              $dir | Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+            }
+
+            # Do not execute stampinf.exe /?. It can print valid help and still
+            # return exit code 1, which was the v2 workflow failure.
+            Write-Host "WDK tool discovery PASS"
+          }
+          finally {
+            Stop-Transcript | Out-Null
           }
 
-          $signtool = Get-Command signtool.exe -ErrorAction SilentlyContinue
-          if ($signtool) {
-            Write-Host "signtool.exe:"
-            $signtool.Source
-          } else {
-            Write-Host "WARNING: signtool.exe is not on PATH"
+      - name: Verify selected build tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $log = Join-Path $env:GITHUB_WORKSPACE "logs\build-environment.log"
+          Start-Transcript -Path $log -Force | Out-Null
+          try {
+            Write-Host "MSBuild path: $env:MSBUILD_PATH"
+            if (!(Test-Path -LiteralPath $env:MSBUILD_PATH -PathType Leaf)) {
+              throw "Selected MSBuild path does not exist"
+            }
+
+            Write-Host "Selected stampinf path: $env:STAMPINF_PATH"
+            if (!(Test-Path -LiteralPath $env:STAMPINF_PATH -PathType Leaf)) {
+              throw "Selected stampinf path does not exist"
+            }
+            Write-Host "Get-Command stampinf.exe: $((Get-Command stampinf.exe).Source)"
+
+            if ($env:INF2CAT_PATH) {
+              Write-Host "Selected inf2cat path: $env:INF2CAT_PATH"
+              if (!(Test-Path -LiteralPath $env:INF2CAT_PATH -PathType Leaf)) {
+                throw "Selected inf2cat path does not exist"
+              }
+            } else {
+              Write-Host "Selected inf2cat path: <not found>"
+            }
+
+            if ($env:SIGNTOOL_PATH) {
+              Write-Host "Selected signtool path: $env:SIGNTOOL_PATH"
+              if (!(Test-Path -LiteralPath $env:SIGNTOOL_PATH -PathType Leaf)) {
+                throw "Selected signtool path does not exist"
+              }
+            } else {
+              Write-Host "Selected signtool path: <not found>"
+            }
+
+            Write-Host "Build environment verification PASS"
+          }
+          finally {
+            Stop-Transcript | Out-Null
           }
 
-          Write-Host "Build environment verification PASS"
-
-      - name: Build QDMA x64 Release
+      - name: Build libqdma Release x64
+        id: libqdma
+        continue-on-error: true
         shell: pwsh
         working-directory: dma_ip_drivers/QDMA/windows
         run: |
-          $ErrorActionPreference = "Stop"
-          msbuild QDMA.sln /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
-          if ($LASTEXITCODE -ne 0) {
-            throw "MSBuild failed with exit code $LASTEXITCODE"
+          $ErrorActionPreference = "Continue"
+          $log = Join-Path $env:GITHUB_WORKSPACE "logs\libqdma-release-x64.log"
+          $binlog = Join-Path $env:GITHUB_WORKSPACE "logs\libqdma-release-x64.binlog"
+          $fileLog = Join-Path $env:GITHUB_WORKSPACE "logs\libqdma-release-x64-diagnostic.log"
+          $solutionDir = (Resolve-Path ".").Path + "/"
+          $buildArgs = @(
+            "sys/libqdma/libqdma.vcxproj", "/m",
+            "/p:Configuration=Release", "/p:Platform=x64",
+            "/p:SolutionDir=$solutionDir",
+            "/verbosity:minimal", "/bl:$binlog",
+            "/flp:logfile=$fileLog;verbosity=diagnostic"
+          )
+
+          & $env:MSBUILD_PATH @buildArgs 2>&1 |
+            Tee-Object -FilePath $log
+          $buildExit = $LASTEXITCODE
+
+          if ($buildExit -ne 0) {
+            $text = Get-Content -LiteralPath $log -Raw
+            if ($text -match '(?im)(fatal error|error)\s+C\d{4}') {
+              $category = "A_LIBQDMA_C_CPP_COMPILE_FAILURE"
+            } elseif ($text -match '(?im)MSB\d{4}') {
+              $category = "BUILD_ENVIRONMENT_OR_PROJECT_CONFIGURATION_FAILURE"
+            } else {
+              $category = "LIBQDMA_BUILD_FAILURE_UNCLASSIFIED"
+            }
+            "libqdma=FAIL; category=$category; exit=$buildExit" |
+              Add-Content (Join-Path $env:GITHUB_WORKSPACE "logs\build-classification.txt")
+            Write-Error "libqdma failed: $category (exit $buildExit)"
+            exit $buildExit
           }
 
-      - name: Show build outputs
+          "libqdma=PASS" |
+            Add-Content (Join-Path $env:GITHUB_WORKSPACE "logs\build-classification.txt")
+          Write-Host "libqdma Release x64 PASS"
+
+      - name: Build complete QDMA solution Release x64
+        id: solution
+        if: steps.libqdma.outcome == 'success'
+        continue-on-error: true
         shell: pwsh
+        working-directory: dma_ip_drivers/QDMA/windows
         run: |
-          $release = "dma_ip_drivers/QDMA/windows/build/x64/Release"
-          if (!(Test-Path $release)) {
-            throw "Release output directory not found: $release"
+          $ErrorActionPreference = "Continue"
+          $log = Join-Path $env:GITHUB_WORKSPACE "logs\solution-release-x64.log"
+          $binlog = Join-Path $env:GITHUB_WORKSPACE "logs\solution-release-x64.binlog"
+          $fileLog = Join-Path $env:GITHUB_WORKSPACE "logs\solution-release-x64-diagnostic.log"
+          $buildArgs = @(
+            "QDMA.sln", "/m",
+            "/p:Configuration=Release", "/p:Platform=x64",
+            "/verbosity:minimal", "/bl:$binlog",
+            "/flp:logfile=$fileLog;verbosity=diagnostic"
+          )
+
+          & $env:MSBUILD_PATH @buildArgs 2>&1 |
+            Tee-Object -FilePath $log
+          $buildExit = $LASTEXITCODE
+
+          if ($buildExit -ne 0) {
+            $lines = Get-Content -LiteralPath $log
+            $errorText = (($lines | Where-Object {
+              $_ -match '(?i)(error|fatal|failed)'
+            }) -join "`n")
+
+            if ($errorText -match
+                '(?i)(stampinf|inf2cat|signtool|signfile|driverpackage|infverif|error\s+22\.)') {
+              $category = "C_INF_STAMPINF_INF2CAT_SIGNING_FAILURE"
+            } elseif (($errorText -match '(?i)(LNK\d{4}|LINK\s*:\s*fatal)') -and
+                      ($errorText -match '(?i)(qdma_generic|QDMA\.sys)')) {
+              $category = "B_DRIVER_LINK_FAILURE"
+            } elseif ($errorText -match '(?i)(LNK\d{4}|LINK\s*:\s*fatal)') {
+              $category = "NON_DRIVER_LINK_FAILURE"
+            } elseif ($errorText -match '(?i)(fatal error|error)\s+C\d{4}') {
+              $category = "CPP_COMPILE_FAILURE_OUTSIDE_STANDALONE_LIBQDMA"
+            } elseif ($errorText -match '(?i)MSB\d{4}') {
+              $category = "BUILD_ENVIRONMENT_OR_PROJECT_CONFIGURATION_FAILURE"
+            } else {
+              $category = "SOLUTION_BUILD_FAILURE_UNCLASSIFIED"
+            }
+
+            "solution=FAIL; category=$category; exit=$buildExit" |
+              Add-Content (Join-Path $env:GITHUB_WORKSPACE "logs\build-classification.txt")
+            Write-Error "QDMA.sln failed: $category (exit $buildExit)"
+            exit $buildExit
           }
 
-          Get-ChildItem -Recurse $release |
-            Select-Object FullName, Length
+          "solution=PASS" |
+            Add-Content (Join-Path $env:GITHUB_WORKSPACE "logs\build-classification.txt")
+          Write-Host "QDMA.sln Release x64 PASS"
 
-      - name: Collect driver and tools
+      - name: Collect logs, patched sources, and generated binaries
+        if: always()
         shell: pwsh
         run: |
-          $release = "dma_ip_drivers/QDMA/windows/build/x64/Release"
-          New-Item -ItemType Directory -Force artifact | Out-Null
-          Copy-Item "$release\*" "artifact\" -Recurse -Force
+          $artifact = Join-Path $env:GITHUB_WORKSPACE "artifact"
+          New-Item -ItemType Directory -Force $artifact | Out-Null
 
-          Write-Host "Collected files:"
-          Get-ChildItem -Recurse artifact |
+          $logs = Join-Path $env:GITHUB_WORKSPACE "logs"
+          if (Test-Path -LiteralPath $logs) {
+            Copy-Item -LiteralPath $logs -Destination `
+              (Join-Path $artifact "logs") -Recurse -Force
+          }
+
+          if ("${{ steps.patch.outcome }}" -eq "success") {
+            $patched = Join-Path $artifact "patched-source"
+            New-Item -ItemType Directory -Force $patched | Out-Null
+            $access = Join-Path $env:GITHUB_WORKSPACE `
+              "dma_ip_drivers\QDMA\windows\sys\libqdma\source\qdma_access"
+            Copy-Item -LiteralPath (Join-Path $access "qdma_access_common.c") `
+              -Destination $patched -Force
+            Copy-Item -LiteralPath (Join-Path $access "qdma_access_export.h") `
+              -Destination $patched -Force
+          }
+
+          $release = Join-Path $env:GITHUB_WORKSPACE `
+            "dma_ip_drivers\QDMA\windows\build\x64\Release"
+          if (Test-Path -LiteralPath $release) {
+            Copy-Item -LiteralPath $release -Destination `
+              (Join-Path $artifact "binaries") -Recurse -Force
+          } else {
+            "No x64 Release output directory was generated." |
+              Set-Content (Join-Path $artifact "NO_BINARIES.txt")
+          }
+
+          Copy-Item -LiteralPath `
+            (Join-Path $env:GITHUB_WORKSPACE "CPM5_PHASE1.patch") `
+            -Destination $artifact -Force
+
+          Write-Host "Artifact contents:"
+          Get-ChildItem -LiteralPath $artifact -Recurse |
             Select-Object FullName, Length
 
-      - name: Upload QDMA Windows package
+      - name: Publish build summary
+        if: always()
+        shell: pwsh
+        run: |
+          $baseline = "${{ steps.baseline.outcome }}"
+          $patch = "${{ steps.patch.outcome }}"
+          $nuget = "${{ steps.nuget.outcome }}"
+          $tools = "${{ steps.tools.outcome }}"
+          $lib = "${{ steps.libqdma.outcome }}"
+          $solution = "${{ steps.solution.outcome }}"
+
+          @"
+          ## CPM5 Phase 1 cloud build
+
+          | Stage | Outcome |
+          |---|---|
+          | Exact baseline checkout | $baseline |
+          | Baseline/patch verification | $patch |
+          | NuGet restore | $nuget |
+          | WDK tool discovery | $tools |
+          | libqdma Release x64 | $lib |
+          | QDMA.sln Release x64 | $solution |
+          "@ | Add-Content $env:GITHUB_STEP_SUMMARY
+
+          $classification = Join-Path $env:GITHUB_WORKSPACE `
+            "logs\build-classification.txt"
+          if (Test-Path -LiteralPath $classification) {
+            Add-Content $env:GITHUB_STEP_SUMMARY `
+              ([Environment]::NewLine + "### Failure classification / build result")
+            $fence = [string]([char]96) * 3
+            Add-Content $env:GITHUB_STEP_SUMMARY ($fence + "text")
+            Get-Content -LiteralPath $classification |
+              Add-Content $env:GITHUB_STEP_SUMMARY
+            Add-Content $env:GITHUB_STEP_SUMMARY $fence
+          }
+
+      - name: Upload CPM5 Phase 1 build artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: qdma-windows-x64-release
+          name: cpm5-phase1-windows-x64-${{ github.run_number }}
           path: artifact/**
           if-no-files-found: error
           retention-days: 14
+
+      - name: Enforce build acceptance
+        if: always()
+        shell: pwsh
+        run: |
+          if ("${{ steps.baseline.outcome }}" -ne "success") {
+            throw "Exact baseline acquisition failed; no fallback was attempted."
+          }
+          if ("${{ steps.patch.outcome }}" -ne "success") {
+            throw "Baseline or Phase 1 patch verification failed."
+          }
+          if ("${{ steps.nuget.outcome }}" -ne "success") {
+            throw "NuGet restore failed."
+          }
+          if ("${{ steps.tools.outcome }}" -ne "success") {
+            throw "Required build-tool discovery failed."
+          }
+          if ("${{ steps.libqdma.outcome }}" -ne "success") {
+            throw "Phase 1 acceptance failed at standalone libqdma build. See classification logs."
+          }
+          if ("${{ steps.solution.outcome }}" -ne "success") {
+            throw "Standalone libqdma passed, but complete solution failed. See B/C/other classification logs."
+          }
+          Write-Host "FULL BUILD ACCEPTED"
