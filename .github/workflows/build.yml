@@ -28,109 +28,166 @@ jobs:
         run: |
           nuget restore QDMA.sln -PackagesDirectory packages
 
-      - name: Locate WDK tools and add them to PATH
+      - name: Configure WDK tools
         shell: pwsh
         run: |
-          $searchRoots = @(
+          $ErrorActionPreference = "Stop"
+
+          $roots = @(
             "${env:ProgramFiles(x86)}\Windows Kits\10\bin",
             "$env:GITHUB_WORKSPACE\dma_ip_drivers\QDMA\windows\packages"
           )
 
-          Write-Host "Searching for stampinf.exe..."
-
-          $all = @()
-          foreach ($root in $searchRoots) {
-            if (Test-Path $root) {
-              $all += Get-ChildItem -Path $root -Filter stampinf.exe -Recurse -ErrorAction SilentlyContinue
+          function Find-Tool([string]$name) {
+            $hits = @()
+            foreach ($root in $roots) {
+              if (Test-Path $root) {
+                $hits += Get-ChildItem -Path $root -Filter $name -Recurse -File -ErrorAction SilentlyContinue
+              }
             }
+            return $hits
           }
 
-          if (-not $all -or $all.Count -eq 0) {
-            Write-Host "WDK bin tree:"
-            Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -ErrorAction SilentlyContinue |
-              Select-Object -First 200 FullName
+          $stampHits = @(Find-Tool "stampinf.exe")
+          if ($stampHits.Count -eq 0) {
             throw "stampinf.exe not found"
           }
 
-          $all | ForEach-Object { Write-Host "Found: $($_.FullName)" }
+          Write-Host "stampinf.exe candidates:"
+          $stampHits | ForEach-Object { Write-Host "  $($_.FullName)" }
 
-          # Prefer an x64 WDK tool directory.
-          $stamp = $all |
-            Where-Object { $_.DirectoryName -match '\\x64$' } |
+          # Prefer the normal Windows Kits x64 installation over the NuGet copy.
+          $stamp = $stampHits |
+            Where-Object {
+              $_.FullName -like "*Windows Kits\10\bin*" -and
+              $_.DirectoryName -match '\\x64$'
+            } |
             Sort-Object FullName -Descending |
             Select-Object -First 1
 
           if (-not $stamp) {
-            $stamp = $all | Sort-Object FullName -Descending | Select-Object -First 1
-          }
-
-          $wdkToolDir = $stamp.DirectoryName
-
-          Write-Host "Using WDK tool directory: $wdkToolDir"
-          Write-Host "stampinf.exe = $($stamp.FullName)"
-
-          # Make WDK tools visible to all subsequent GitHub Actions steps.
-          $wdkToolDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-          # Also expose it in this diagnostic step.
-          $env:PATH = "$wdkToolDir;$env:PATH"
-
-          & stampinf.exe /?
-          Write-Host "stampinf.exe is now callable."
-
-          # Print other packaging tools if present.
-          foreach ($tool in @("inf2cat.exe", "signtool.exe")) {
-            $found = Get-ChildItem -Path (Split-Path $wdkToolDir -Parent) -Filter $tool -Recurse -ErrorAction SilentlyContinue |
+            $stamp = $stampHits |
+              Where-Object { $_.DirectoryName -match '\\x64$' } |
+              Sort-Object FullName -Descending |
               Select-Object -First 1
-            if ($found) {
-              Write-Host "$tool = $($found.FullName)"
-            } else {
-              Write-Host "WARNING: $tool not found near selected WDK tools."
-            }
           }
+
+          if (-not $stamp) {
+            $stamp = $stampHits | Select-Object -First 1
+          }
+
+          Write-Host "Selected stampinf.exe:"
+          Write-Host "  $($stamp.FullName)"
+
+          $toolDirs = New-Object System.Collections.Generic.List[string]
+          $toolDirs.Add($stamp.DirectoryName)
+
+          foreach ($toolName in @("inf2cat.exe", "signtool.exe")) {
+            $hits = @(Find-Tool $toolName)
+
+            if ($hits.Count -eq 0) {
+              Write-Host "WARNING: $toolName not found"
+              continue
+            }
+
+            $selected = $hits |
+              Where-Object {
+                $_.FullName -like "*Windows Kits\10\bin*" -and
+                $_.DirectoryName -match '\\x64$'
+              } |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+
+            if (-not $selected) {
+              $selected = $hits |
+                Where-Object { $_.DirectoryName -match '\\x64$' } |
+                Sort-Object FullName -Descending |
+                Select-Object -First 1
+            }
+
+            if (-not $selected) {
+              $selected = $hits | Select-Object -First 1
+            }
+
+            Write-Host "$toolName = $($selected.FullName)"
+            $toolDirs.Add($selected.DirectoryName)
+          }
+
+          $toolDirs = $toolDirs | Select-Object -Unique
+
+          Write-Host ""
+          Write-Host "Adding WDK/SDK tool directories to PATH:"
+          foreach ($dir in $toolDirs) {
+            Write-Host "  $dir"
+            $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          }
+
+          # Do NOT run "stampinf.exe /?" here:
+          # StampInf prints help but may return exit code 1, causing the Action
+          # step to fail even though the executable exists.
+          Write-Host ""
+          Write-Host "WDK tool discovery PASS"
 
       - name: Verify build environment
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           Write-Host "MSBuild:"
-          Get-Command msbuild | Format-List Source
+          (Get-Command msbuild).Source
 
-          Write-Host "StampInf:"
-          Get-Command stampinf.exe | Format-List Source
+          Write-Host "stampinf.exe:"
+          (Get-Command stampinf.exe).Source
 
-          Write-Host "PATH:"
-          $env:PATH
+          $inf2cat = Get-Command inf2cat.exe -ErrorAction SilentlyContinue
+          if ($inf2cat) {
+            Write-Host "inf2cat.exe:"
+            $inf2cat.Source
+          } else {
+            Write-Host "WARNING: inf2cat.exe is not on PATH"
+          }
+
+          $signtool = Get-Command signtool.exe -ErrorAction SilentlyContinue
+          if ($signtool) {
+            Write-Host "signtool.exe:"
+            $signtool.Source
+          } else {
+            Write-Host "WARNING: signtool.exe is not on PATH"
+          }
+
+          Write-Host "Build environment verification PASS"
 
       - name: Build QDMA x64 Release
         shell: pwsh
         working-directory: dma_ip_drivers/QDMA/windows
         run: |
+          $ErrorActionPreference = "Stop"
           msbuild QDMA.sln /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
+          if ($LASTEXITCODE -ne 0) {
+            throw "MSBuild failed with exit code $LASTEXITCODE"
+          }
 
       - name: Show build outputs
         shell: pwsh
         run: |
-          if (Test-Path "dma_ip_drivers/QDMA/windows/build/x64/Release") {
-            Get-ChildItem -Recurse "dma_ip_drivers/QDMA/windows/build/x64/Release" |
-              Select-Object FullName, Length
-          } else {
-            Write-Host "Release output directory not found."
-          }
-
-      - name: Collect driver and tools
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force artifact | Out-Null
-
           $release = "dma_ip_drivers/QDMA/windows/build/x64/Release"
           if (!(Test-Path $release)) {
             throw "Release output directory not found: $release"
           }
 
+          Get-ChildItem -Recurse $release |
+            Select-Object FullName, Length
+
+      - name: Collect driver and tools
+        shell: pwsh
+        run: |
+          $release = "dma_ip_drivers/QDMA/windows/build/x64/Release"
+          New-Item -ItemType Directory -Force artifact | Out-Null
           Copy-Item "$release\*" "artifact\" -Recurse -Force
 
-          Write-Host "Collected artifact:"
-          Get-ChildItem -Recurse artifact | Select-Object FullName, Length
+          Write-Host "Collected files:"
+          Get-ChildItem -Recurse artifact |
+            Select-Object FullName, Length
 
       - name: Upload QDMA Windows package
         uses: actions/upload-artifact@v4
